@@ -1,0 +1,43 @@
+name: Patch Notes Notifier
+
+on:
+  schedule:
+    # 매 30분마다 실행 (UTC 기준). 컴퓨터가 꺼져 있어도 GitHub 서버에서 동작합니다.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: Playwright 브라우저 설치
+        run: playwright install --with-deps chromium
+
+      - name: 패치노트 확인 및 디스코드 전송
+        env:
+          DISCORD_WEBHOOK_VALORANT: ${{ secrets.DISCORD_WEBHOOK_VALORANT }}
+          DISCORD_WEBHOOK_PUBG: ${{ secrets.DISCORD_WEBHOOK_PUBG }}
+          DISCORD_WEBHOOK_VALORANT_ISSUES: ${{ secrets.DISCORD_WEBHOOK_VALORANT_ISSUES }}
+        run: python scripts/check_patches.py
+
+      - name: 상태 파일 커밋
+        run: |
+          git config user.name "patch-notify-bot"
+          git config user.email "actions@github.com"
+          git add state/state.json
+          git diff --cached --quiet || git commit -m "chore: update patch state"
+          git push
