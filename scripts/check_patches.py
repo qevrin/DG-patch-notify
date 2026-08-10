@@ -75,7 +75,8 @@ def fetch_valorant_ids():
     ids = []
     for a in soup.select("a[href*='valorant-patch-notes-']"):
         href = a.get("href")
-        m = re.search(r"(valorant-patch-notes-[\d.]+[a-z]?)", href or "")
+        # 실제 슬러그는 점(.)이 아니라 하이픈 형식입니다. 예: valorant-patch-notes-13-02
+        m = re.search(r"(valorant-patch-notes-\d+-\d+[a-z]?)", href or "")
         if not m:
             continue
         slug = m.group(1).rstrip("/")
@@ -95,7 +96,9 @@ def fetch_pubg_ids():
         browser = p.chromium.launch()
         page = browser.new_page(user_agent=HEADERS["User-Agent"])
         page.goto(PUBG_LIST_URL, wait_until="networkidle", timeout=30000)
-        page.wait_for_selector("a[href]", timeout=15000)
+        # state="attached": 화면에 "보이는" 링크가 아니라 DOM에 "존재하는" 링크가 하나라도
+        # 생기면 통과. (숨겨진 네비게이션 링크 때문에 visible 대기 시 타임아웃 나던 문제 수정)
+        page.wait_for_selector("a[href]", state="attached", timeout=15000)
         anchors = page.query_selector_all("a[href]")
         for a in anchors:
             href = a.get_attribute("href") or ""
