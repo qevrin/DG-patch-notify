@@ -2,8 +2,8 @@ name: Patch Notes Notifier
 
 on:
   schedule:
-    # 매일 UTC 0시(한국시간 오전 9시)에 한 번 실행. 컴퓨터가 꺼져 있어도 GitHub 서버에서 동작합니다.
-    - cron: "0 0 * * *"
+    # 매 30분마다 실행 (UTC 기준). 컴퓨터가 꺼져 있어도 GitHub 서버에서 동작합니다.
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -32,6 +32,7 @@ jobs:
           DISCORD_WEBHOOK_VALORANT: ${{ secrets.DISCORD_WEBHOOK_VALORANT }}
           DISCORD_WEBHOOK_PUBG: ${{ secrets.DISCORD_WEBHOOK_PUBG }}
           DISCORD_WEBHOOK_VALORANT_ISSUES: ${{ secrets.DISCORD_WEBHOOK_VALORANT_ISSUES }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python scripts/check_patches.py
 
       - name: 상태 파일 커밋

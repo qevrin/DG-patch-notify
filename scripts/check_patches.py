@@ -133,8 +133,19 @@ def fetch_article_details(url):
     description = meta("og:description") or ""
     image = meta("og:image")
 
+    # 실제 본문 제목(예: "발로란트 13.02 패치 노트")과 일치하는 헤딩 태그를 찾아,
+    # 그 지점부터 나오는 h2만 훑는다. 이렇게 해야 사이트 상단 메뉴/사이드바에 있는
+    # h2("펍지 더 알아보기" 같은 것)를 패치 섹션으로 잘못 인식하지 않는다.
+    title_tag = None
+    for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
+        text = tag.get_text(" ", strip=True)
+        if text and (text in title or title in text):
+            title_tag = tag
+            break
+
+    headings = title_tag.find_all_next("h2") if title_tag else soup.find_all("h2")
+
     sections = []
-    headings = soup.find_all("h2")
     for h in headings[:MAX_SECTIONS]:
         heading_text = h.get_text(" ", strip=True)
         if not heading_text:
@@ -143,16 +154,16 @@ def fetch_article_details(url):
         for el in h.find_all_next():
             if el.name == "h2":
                 break
-            if el.name == "li":
+            # 하위 목록을 담고 있는 상위 <li>는 건너뛴다. 상위 li의 텍스트에는
+            # 하위 li 내용이 그대로 포함돼 있어서, 둘 다 넣으면 문장이 중복된다.
+            if el.name == "li" and not el.find("li"):
                 text = el.get_text(" ", strip=True)
                 if text and text not in bullets:
                     bullets.append(text)
-            if len(bullets) >= MAX_BULLETS:
-                # 이후 li는 더 안 모으되, 다음 h2가 나올 때까지는 계속 훑어야
-                # 섹션 경계를 놓치지 않는다. 개수만 더 안 늘린다.
-                continue
         if bullets:
             sections.append({"title": heading_text, "bullets": bullets[:MAX_BULLETS]})
+
+    raw_text = _gather_raw_text(title_tag)
 
     return {
         "title": title,
@@ -160,7 +171,100 @@ def fetch_article_details(url):
         "description": description,
         "image": image,
         "sections": sections,
+        "raw_text": raw_text,
     }
+
+
+def _gather_raw_text(title_tag, max_chars=12000):
+    """AI 요약용 원문 텍스트 모음. 정교하게 다듬지 않고 넉넉히 모아서
+    AI가 알아서 정리/중복 제거하도록 한다."""
+    if not title_tag:
+        return ""
+    parts = []
+    total = 0
+    for el in title_tag.find_all_next(["h2", "h3", "p", "li"]):
+        text = el.get_text(" ", strip=True)
+        if not text:
+            continue
+        parts.append(text)
+        total += len(text)
+        if total >= max_chars:
+            break
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# AI 요약 (ANTHROPIC_API_KEY가 설정된 경우에만 동작, 실패 시 원문 섹션으로 대체)
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+AI_MODEL = "claude-haiku-4-5-20251001"
+
+AI_SYSTEM_PROMPT = (
+    "당신은 게임 패치노트를 한국어 디스코드 커뮤니티용으로 간결하게 정리하는 도우미입니다. "
+    "아래 원문 패치노트 텍스트를 읽고, 다음 JSON 형식으로만 답하세요. "
+    "다른 설명이나 코드블록 표시 없이 JSON 객체 하나만 출력하세요.\n"
+    '{"intro": "패치 전체를 한두 문장으로 요약", '
+    '"sections": [{"emoji": "섹션에 어울리는 이모지 1개", "title": "섹션 제목", '
+    '"bullets": ["핵심만 담은 짧은 항목", "..."]}]}\n'
+    "규칙: 섹션은 최대 6개, 섹션당 bullet은 최대 5개, 각 bullet은 40자 내외로 압축. "
+    "오타 수정이나 사소한 UI 정렬처럼 플레이어에게 중요하지 않은 내용은 제외하고, "
+    "실질적으로 게임플레이에 영향을 주는 변경사항 위주로 정리하세요. "
+    "원문에 없는 내용을 추측해서 넣지 마세요."
+)
+
+
+def summarize_with_ai(raw_text):
+    if not ANTHROPIC_API_KEY or not raw_text:
+        return None
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        resp = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=1200,
+            system=AI_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": raw_text}],
+        )
+        text = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        ).strip()
+        text = re.sub(r"^```(json)?\s*|\s*```$", "", text)
+        return json.loads(text)
+    except Exception as e:
+        print(f"[경고] AI 요약 실패, 원문 섹션으로 대체합니다: {e}", file=sys.stderr)
+        return None
+
+
+def build_embed_from_ai(details, ai_data, color):
+    embed = {
+        "title": details["title"][:250],
+        "url": details["url"],
+        "description": (ai_data.get("intro") or "")[:400],
+        "color": color,
+    }
+    if details.get("image"):
+        embed["thumbnail"] = {"url": details["image"]}
+
+    fields = []
+    used_chars = 0
+    for section in ai_data.get("sections", [])[:6]:
+        bullets = section.get("bullets", [])[:5]
+        value = "\n".join(f"• {b}" for b in bullets)
+        if len(value) > MAX_FIELD_CHARS:
+            value = value[:MAX_FIELD_CHARS] + "…"
+        if used_chars + len(value) > 5000:
+            break
+        emoji = section.get("emoji") or "📌"
+        name = f"{emoji} {section.get('title', '')}"[:250]
+        fields.append({"name": name, "value": value or "-", "inline": False})
+        used_chars += len(value)
+
+    if fields:
+        embed["fields"] = fields
+
+    return embed
 
 
 # ---------------------------------------------------------------------------
@@ -229,12 +333,20 @@ def main():
         print("최초 실행: 기존 글을 기준선으로 저장했습니다 (알림 없음).")
         return
 
+    def process(article_url, webhook, color):
+        details = fetch_article_details(article_url)
+        ai_data = summarize_with_ai(details.get("raw_text"))
+        if ai_data:
+            embed = build_embed_from_ai(details, ai_data, color)
+        else:
+            embed = build_embed(details, color)  # AI 미사용/실패 시 원문 섹션으로 대체
+        send_discord(webhook, embed)
+
     # 발로란트: 새 글만 오래된 순으로 처리
     new_valorant = [i for i in valorant_ids if i not in state["valorant"]]
     for article_url in reversed(new_valorant):
         try:
-            details = fetch_article_details(article_url)
-            send_discord(WEBHOOK_VALORANT, build_embed(details, color=0xFF4655))
+            process(article_url, WEBHOOK_VALORANT, color=0xFF4655)
         except Exception as e:
             print(f"[오류] 발로란트 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
             continue  # 실패하면 state에 기록하지 않아 다음 실행에 재시도
@@ -244,8 +356,7 @@ def main():
     new_pubg = [i for i in pubg_ids if i not in state["pubg"]]
     for article_url in reversed(new_pubg):
         try:
-            details = fetch_article_details(article_url)
-            send_discord(WEBHOOK_PUBG, build_embed(details, color=0xF2A900))
+            process(article_url, WEBHOOK_PUBG, color=0xF2A900)
         except Exception as e:
             print(f"[오류] PUBG 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
             continue
