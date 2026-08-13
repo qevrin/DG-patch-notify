@@ -20,6 +20,7 @@ jobs:
       - name: 격주 여부 확인
         id: biweekly
         run: |
+<<<<<<< HEAD
           # 2026-07-14(실제 관측된 패치 화요일)를 기준점으로 삼아,
           # 그날로부터 정확히 14일 간격인 화요일에만 실행되도록 한다.
           anchor="2026-07-14"
@@ -33,6 +34,14 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "이번 주는 건너뜁니다 (기준일로부터 ${diff_days}일 경과, 다음 주에 실행됩니다)"
+=======
+          week=$(date -u +%V)
+          if [ $((10#$week % 2)) -eq 0 ]; then
+            echo "이번 주는 실행 대상 주입니다 (ISO 주차: $week)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "이번 주는 건너뜁니다 (ISO 주차: $week, 다음 주에 실행됩니다)"
+>>>>>>> 86fc9e735c360e95b13d27fdeafd5e558025382e
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
