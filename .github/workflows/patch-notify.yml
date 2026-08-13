@@ -57,6 +57,7 @@ jobs:
           DISCORD_WEBHOOK_PUBG: ${{ secrets.DISCORD_WEBHOOK_PUBG }}
           DISCORD_WEBHOOK_VALORANT_ISSUES: ${{ secrets.DISCORD_WEBHOOK_VALORANT_ISSUES }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO_RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/main/assets
         run: python scripts/check_patches.py
 
       - name: 상태 파일 커밋
