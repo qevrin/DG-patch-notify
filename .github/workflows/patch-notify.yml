@@ -2,8 +2,9 @@ name: Patch Notes Notifier
 
 on:
   schedule:
-    # 매 30분마다 실행 (UTC 기준). 컴퓨터가 꺼져 있어도 GitHub 서버에서 동작합니다.
-    - cron: "*/30 * * * *"
+    # 매주 화요일 UTC 12:00 (한국시간 오후 9시)에 트리거되지만,
+    # 아래 "격주 여부 확인" 스텝에서 짝수 주에만 실제로 동작하도록 걸러냅니다.
+    - cron: "0 12 * * 2"
   workflow_dispatch: {}
 
 permissions:
@@ -16,18 +17,41 @@ jobs:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
 
+      - name: 격주 여부 확인
+        id: biweekly
+        run: |
+          # 2026-07-14(실제 관측된 패치 화요일)를 기준점으로 삼아,
+          # 그날로부터 정확히 14일 간격인 화요일에만 실행되도록 한다.
+          anchor="2026-07-14"
+          today=$(date -u +%Y-%m-%d)
+          anchor_ts=$(date -u -d "$anchor" +%s)
+          today_ts=$(date -u -d "$today" +%s)
+          diff_days=$(( (today_ts - anchor_ts) / 86400 ))
+          remainder=$(( ((diff_days % 14) + 14) % 14 ))
+          if [ "$remainder" -eq 0 ]; then
+            echo "이번 주는 실행 대상 주입니다 (기준일로부터 ${diff_days}일 경과)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "이번 주는 건너뜁니다 (기준일로부터 ${diff_days}일 경과, 다음 주에 실행됩니다)"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 파이썬 설치
+        if: steps.biweekly.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: 의존성 설치
+        if: steps.biweekly.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
         run: pip install -r requirements.txt
 
       - name: Playwright 브라우저 설치
+        if: steps.biweekly.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
         run: playwright install --with-deps chromium
 
       - name: 패치노트 확인 및 디스코드 전송
+        if: steps.biweekly.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
         env:
           DISCORD_WEBHOOK_VALORANT: ${{ secrets.DISCORD_WEBHOOK_VALORANT }}
           DISCORD_WEBHOOK_PUBG: ${{ secrets.DISCORD_WEBHOOK_PUBG }}
@@ -36,9 +60,11 @@ jobs:
         run: python scripts/check_patches.py
 
       - name: 상태 파일 커밋
+        if: steps.biweekly.outputs.run == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           git config user.name "patch-notify-bot"
           git config user.email "actions@github.com"
           git add state/state.json
           git diff --cached --quiet || git commit -m "chore: update patch state"
           git push
+
