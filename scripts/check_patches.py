@@ -39,6 +39,12 @@ WEBHOOK_VALORANT = os.environ.get("DISCORD_WEBHOOK_VALORANT")
 WEBHOOK_PUBG = os.environ.get("DISCORD_WEBHOOK_PUBG")
 WEBHOOK_VALORANT_ISSUES = os.environ.get("DISCORD_WEBHOOK_VALORANT_ISSUES")  # 나중에 사용
 
+# 저장소 assets 폴더에 넣어둔 배너 이미지의 raw URL. 워크플로우에서
+# REPO_RAW_BASE 환경변수로 "https://raw.githubusercontent.com/<owner>/<repo>/main/assets"를 넘겨준다.
+_REPO_RAW_BASE = os.environ.get("REPO_RAW_BASE", "")
+VALORANT_BANNER_URL = f"{_REPO_RAW_BASE}/valorant_banner.png" if _REPO_RAW_BASE else None
+PUBG_BANNER_URL = f"{_REPO_RAW_BASE}/pubg_banner.png" if _REPO_RAW_BASE else None
+
 HEADERS = {"User-Agent": "Mozilla/5.0 (patch-notify-bot)"}
 
 MAX_SECTIONS = 8       # 임베드에 담을 최대 섹션(필드) 수
@@ -307,28 +313,50 @@ def send_discord(webhook_url, embed):
     print(f"[전송완료] {embed.get('title')}")
 
 
+def send_banner(webhook_url, banner_url):
+    """새 패치노트 카드보다 먼저, 꾸며둔 배너 이미지를 한 장 보낸다."""
+    if not webhook_url or not banner_url:
+        return
+    try:
+        resp = requests.post(webhook_url, json={"embeds": [{"image": {"url": banner_url}}]}, timeout=20)
+        resp.raise_for_status()
+        print(f"[배너 전송완료] {banner_url}")
+    except Exception as e:
+        print(f"[경고] 배너 전송 실패: {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
 
 def main():
+    # 커맨드라인 인자로 "valorant" 또는 "pubg"를 주면 그 게임만 확인한다.
+    # 인자가 없으면(all) 기존처럼 둘 다 확인한다.
+    game_filter = sys.argv[1] if len(sys.argv) > 1 else "all"
+    check_valorant = game_filter in ("all", "valorant")
+    check_pubg = game_filter in ("all", "pubg")
+
     state, existed = load_state()
 
-    try:
-        valorant_ids = fetch_valorant_ids()
-    except Exception as e:
-        print(f"[오류] 발로란트 목록 조회 실패: {e}", file=sys.stderr)
-        valorant_ids = []
+    valorant_ids = []
+    if check_valorant:
+        try:
+            valorant_ids = fetch_valorant_ids()
+        except Exception as e:
+            print(f"[오류] 발로란트 목록 조회 실패: {e}", file=sys.stderr)
 
-    try:
-        pubg_ids = fetch_pubg_ids()
-    except Exception as e:
-        print(f"[오류] PUBG 목록 조회 실패: {e}", file=sys.stderr)
-        pubg_ids = []
+    pubg_ids = []
+    if check_pubg:
+        try:
+            pubg_ids = fetch_pubg_ids()
+        except Exception as e:
+            print(f"[오류] PUBG 목록 조회 실패: {e}", file=sys.stderr)
 
     if not existed:
-        state["valorant"] = valorant_ids
-        state["pubg"] = pubg_ids
+        if check_valorant:
+            state["valorant"] = valorant_ids
+        if check_pubg:
+            state["pubg"] = pubg_ids
         save_state(state)
         print("최초 실행: 기존 글을 기준선으로 저장했습니다 (알림 없음).")
         return
@@ -342,29 +370,34 @@ def main():
             embed = build_embed(details, color)  # AI 미사용/실패 시 원문 섹션으로 대체
         send_discord(webhook, embed)
 
-    # 발로란트: 새 글만 오래된 순으로 처리
-    new_valorant = [i for i in valorant_ids if i not in state["valorant"]]
-    for article_url in reversed(new_valorant):
-        try:
-            process(article_url, WEBHOOK_VALORANT, color=0xFF4655)
-        except Exception as e:
-            print(f"[오류] 발로란트 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-            continue  # 실패하면 state에 기록하지 않아 다음 실행에 재시도
-        state["valorant"].append(article_url)
+    # 발로란트: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
+    if check_valorant:
+        new_valorant = [i for i in valorant_ids if i not in state["valorant"]]
+        if new_valorant:
+            send_banner(WEBHOOK_VALORANT, VALORANT_BANNER_URL)
+        for article_url in reversed(new_valorant):
+            try:
+                process(article_url, WEBHOOK_VALORANT, color=0xFF4655)
+            except Exception as e:
+                print(f"[오류] 발로란트 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
+                continue  # 실패하면 state에 기록하지 않아 다음 실행에 재시도
+            state["valorant"].append(article_url)
+        state["valorant"] = state["valorant"][-200:]
 
-    # PUBG: 새 글만 오래된 순으로 처리
-    new_pubg = [i for i in pubg_ids if i not in state["pubg"]]
-    for article_url in reversed(new_pubg):
-        try:
-            process(article_url, WEBHOOK_PUBG, color=0xF2A900)
-        except Exception as e:
-            print(f"[오류] PUBG 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-            continue
-        state["pubg"].append(article_url)
+    # PUBG: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
+    if check_pubg:
+        new_pubg = [i for i in pubg_ids if i not in state["pubg"]]
+        if new_pubg:
+            send_banner(WEBHOOK_PUBG, PUBG_BANNER_URL)
+        for article_url in reversed(new_pubg):
+            try:
+                process(article_url, WEBHOOK_PUBG, color=0xF2A900)
+            except Exception as e:
+                print(f"[오류] PUBG 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
+                continue
+            state["pubg"].append(article_url)
+        state["pubg"] = state["pubg"][-200:]
 
-    # 상태 파일이 무한정 커지지 않도록 최근 200개만 유지
-    state["valorant"] = state["valorant"][-200:]
-    state["pubg"] = state["pubg"][-200:]
     save_state(state)
 
 
