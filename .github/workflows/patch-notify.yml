@@ -2,9 +2,9 @@ name: Patch Notes Notifier
 
 on:
   schedule:
-    # 매주 화요일 UTC 12:00 (한국시간 오후 9시)에 트리거되지만,
+    # 매주 수요일 UTC 12:00 (한국시간 오후 9시)에 트리거되지만,
     # 아래 "격주 여부 확인" 스텝에서 짝수 주에만 실제로 동작하도록 걸러냅니다.
-    - cron: "0 12 * * 2"
+    - cron: "0 12 * * 3"
   workflow_dispatch: {}
 
 permissions:
