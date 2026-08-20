@@ -32,12 +32,21 @@ from bs4 import BeautifulSoup
 
 VALORANT_LIST_URL = "https://playvalorant.com/ko-kr/news/tags/patch-notes/"
 PUBG_LIST_URL = "https://pubg.com/ko/news?category=patch_notes"
+OVERWATCH_LIST_URL = "https://overwatch.nexon.com/news/patchnotes"
 
 STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "state", "state.json")
 
 WEBHOOK_VALORANT = os.environ.get("DISCORD_WEBHOOK_VALORANT")
 WEBHOOK_PUBG = os.environ.get("DISCORD_WEBHOOK_PUBG")
+WEBHOOK_OVERWATCH = os.environ.get("DISCORD_WEBHOOK_OVERWATCH")
 WEBHOOK_VALORANT_ISSUES = os.environ.get("DISCORD_WEBHOOK_VALORANT_ISSUES")  # 나중에 사용
+
+# 저장소 assets 폴더에 넣어둔 배너 이미지의 raw URL. 워크플로우에서
+# REPO_RAW_BASE 환경변수로 "https://raw.githubusercontent.com/<owner>/<repo>/main/assets"를 넘겨준다.
+_REPO_RAW_BASE = os.environ.get("REPO_RAW_BASE", "")
+VALORANT_BANNER_URL = f"{_REPO_RAW_BASE}/valorant_banner.png" if _REPO_RAW_BASE else None
+PUBG_BANNER_URL = f"{_REPO_RAW_BASE}/pubg_banner.png" if _REPO_RAW_BASE else None
+OVERWATCH_BANNER_URL = f"{_REPO_RAW_BASE}/overwatch_banner.png" if _REPO_RAW_BASE else None
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (patch-notify-bot)"}
 
@@ -54,7 +63,7 @@ def load_state():
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, encoding="utf-8") as f:
             return json.load(f), True
-    return {"valorant": [], "pubg": []}, False
+    return {"valorant": [], "pubg": [], "overwatch": []}, False
 
 
 def save_state(state):
@@ -114,6 +123,31 @@ def fetch_pubg_ids():
     return ids
 
 
+def fetch_overwatch_ids():
+    # 목록 페이지가 자바스크립트 렌더링이라 Playwright로 접근.
+    # URL 패턴: /news/patchnotes/<숫자id>/<슬러그>
+    from playwright.sync_api import sync_playwright
+
+    ids = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(user_agent=HEADERS["User-Agent"])
+        page.goto(OVERWATCH_LIST_URL, wait_until="networkidle", timeout=30000)
+        page.wait_for_selector("a[href]", state="attached", timeout=15000)
+        anchors = page.query_selector_all("a[href]")
+        for a in anchors:
+            href = a.get_attribute("href") or ""
+            m = re.search(r"/news/patchnotes/\d+/[^/?#]+", href)
+            if not m:
+                continue
+            path = m.group(0)
+            canonical = f"https://overwatch.nexon.com{path}"
+            if canonical not in ids:
+                ids.append(canonical)
+        browser.close()
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # 개별 글 페이지에서 제목/설명/이미지/섹션 파싱 (두 사이트 공통 로직)
 # ---------------------------------------------------------------------------
@@ -134,8 +168,8 @@ def fetch_article_details(url):
     image = meta("og:image")
 
     # 실제 본문 제목(예: "발로란트 13.02 패치 노트")과 일치하는 헤딩 태그를 찾아,
-    # 그 지점부터 나오는 h2만 훑는다. 이렇게 해야 사이트 상단 메뉴/사이드바에 있는
-    # h2("펍지 더 알아보기" 같은 것)를 패치 섹션으로 잘못 인식하지 않는다.
+    # 그 지점부터 나오는 헤딩만 훑는다. 이렇게 해야 사이트 상단 메뉴/사이드바에 있는
+    # 헤딩("펍지 더 알아보기" 같은 것)을 패치 섹션으로 잘못 인식하지 않는다.
     title_tag = None
     for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
         text = tag.get_text(" ", strip=True)
@@ -143,7 +177,21 @@ def fetch_article_details(url):
             title_tag = tag
             break
 
-    headings = title_tag.find_all_next("h2") if title_tag else soup.find_all("h2")
+    # 사이트마다 실제 "섹션 제목"으로 쓰는 헤딩 레벨이 다르다
+    # (발로란트/배그는 h2, 오버워치는 h4). title_tag 이후에 가장 많이
+    # 등장하는 레벨을 그 사이트의 섹션 헤딩으로 자동 판단한다.
+    search_root = title_tag.find_all_next() if title_tag else soup.find_all()
+    level_counts = {"h2": 0, "h3": 0, "h4": 0}
+    for el in search_root:
+        if el.name in level_counts:
+            level_counts[el.name] += 1
+    heading_level = max(level_counts, key=lambda lv: level_counts[lv]) if any(level_counts.values()) else None
+
+    headings = (
+        (title_tag.find_all_next(heading_level) if title_tag else soup.find_all(heading_level))
+        if heading_level
+        else []
+    )
 
     sections = []
     for h in headings[:MAX_SECTIONS]:
@@ -152,7 +200,7 @@ def fetch_article_details(url):
             continue
         bullets = []
         for el in h.find_all_next():
-            if el.name == "h2":
+            if el.name == heading_level:
                 break
             # 하위 목록을 담고 있는 상위 <li>는 건너뛴다. 상위 li의 텍스트에는
             # 하위 li 내용이 그대로 포함돼 있어서, 둘 다 넣으면 문장이 중복된다.
@@ -163,7 +211,7 @@ def fetch_article_details(url):
         if bullets:
             sections.append({"title": heading_text, "bullets": bullets[:MAX_BULLETS]})
 
-    raw_text = _gather_raw_text(title_tag)
+    raw_text = _gather_raw_text(title_tag, soup)
 
     return {
         "title": title,
@@ -175,14 +223,16 @@ def fetch_article_details(url):
     }
 
 
-def _gather_raw_text(title_tag, max_chars=12000):
+def _gather_raw_text(title_tag, soup, max_chars=16000):
     """AI 요약용 원문 텍스트 모음. 정교하게 다듬지 않고 넉넉히 모아서
-    AI가 알아서 정리/중복 제거하도록 한다."""
-    if not title_tag:
-        return ""
+    AI가 알아서 정리/중복 제거하도록 한다. title_tag를 못 찾은 경우
+    (예: 오버워치처럼 제목이 헤딩 태그가 아닌 경우) 문서 전체에서 모은다."""
+    source = title_tag.find_all_next(["h2", "h3", "h4", "p", "li"]) if title_tag else soup.find_all(
+        ["h2", "h3", "h4", "p", "li"]
+    )
     parts = []
     total = 0
-    for el in title_tag.find_all_next(["h2", "h3", "p", "li"]):
+    for el in source:
         text = el.get_text(" ", strip=True)
         if not text:
             continue
@@ -307,28 +357,63 @@ def send_discord(webhook_url, embed):
     print(f"[전송완료] {embed.get('title')}")
 
 
+def send_banner(webhook_url, banner_url):
+    """새 패치노트 카드보다 먼저, 꾸며둔 배너 이미지를 한 장 보낸다."""
+    if not webhook_url or not banner_url:
+        return
+    try:
+        resp = requests.post(webhook_url, json={"embeds": [{"image": {"url": banner_url}}]}, timeout=20)
+        resp.raise_for_status()
+        print(f"[배너 전송완료] {banner_url}")
+    except Exception as e:
+        print(f"[경고] 배너 전송 실패: {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
 
 def main():
+    # 커맨드라인 인자로 "valorant", "pubg", "overwatch" 중 하나 이상을
+    # 쉼표로 구분해서 주면 그 게임들만 확인한다 (예: "valorant,pubg").
+    # 인자가 없으면(all) 전부 확인한다.
+    game_filter = sys.argv[1] if len(sys.argv) > 1 else "all"
+    games = [g.strip() for g in game_filter.split(",")]
+    check_valorant = "all" in games or "valorant" in games
+    check_pubg = "all" in games or "pubg" in games
+    check_overwatch = "all" in games or "overwatch" in games
+
     state, existed = load_state()
+    state.setdefault("overwatch", [])
 
-    try:
-        valorant_ids = fetch_valorant_ids()
-    except Exception as e:
-        print(f"[오류] 발로란트 목록 조회 실패: {e}", file=sys.stderr)
-        valorant_ids = []
+    valorant_ids = []
+    if check_valorant:
+        try:
+            valorant_ids = fetch_valorant_ids()
+        except Exception as e:
+            print(f"[오류] 발로란트 목록 조회 실패: {e}", file=sys.stderr)
 
-    try:
-        pubg_ids = fetch_pubg_ids()
-    except Exception as e:
-        print(f"[오류] PUBG 목록 조회 실패: {e}", file=sys.stderr)
-        pubg_ids = []
+    pubg_ids = []
+    if check_pubg:
+        try:
+            pubg_ids = fetch_pubg_ids()
+        except Exception as e:
+            print(f"[오류] PUBG 목록 조회 실패: {e}", file=sys.stderr)
+
+    overwatch_ids = []
+    if check_overwatch:
+        try:
+            overwatch_ids = fetch_overwatch_ids()
+        except Exception as e:
+            print(f"[오류] 오버워치 목록 조회 실패: {e}", file=sys.stderr)
 
     if not existed:
-        state["valorant"] = valorant_ids
-        state["pubg"] = pubg_ids
+        if check_valorant:
+            state["valorant"] = valorant_ids
+        if check_pubg:
+            state["pubg"] = pubg_ids
+        if check_overwatch:
+            state["overwatch"] = overwatch_ids
         save_state(state)
         print("최초 실행: 기존 글을 기준선으로 저장했습니다 (알림 없음).")
         return
@@ -342,29 +427,48 @@ def main():
             embed = build_embed(details, color)  # AI 미사용/실패 시 원문 섹션으로 대체
         send_discord(webhook, embed)
 
-    # 발로란트: 새 글만 오래된 순으로 처리
-    new_valorant = [i for i in valorant_ids if i not in state["valorant"]]
-    for article_url in reversed(new_valorant):
-        try:
-            process(article_url, WEBHOOK_VALORANT, color=0xFF4655)
-        except Exception as e:
-            print(f"[오류] 발로란트 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-            continue  # 실패하면 state에 기록하지 않아 다음 실행에 재시도
-        state["valorant"].append(article_url)
+    # 발로란트: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
+    if check_valorant:
+        new_valorant = [i for i in valorant_ids if i not in state["valorant"]]
+        if new_valorant:
+            send_banner(WEBHOOK_VALORANT, VALORANT_BANNER_URL)
+        for article_url in reversed(new_valorant):
+            try:
+                process(article_url, WEBHOOK_VALORANT, color=0xFF4655)
+            except Exception as e:
+                print(f"[오류] 발로란트 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
+                continue  # 실패하면 state에 기록하지 않아 다음 실행에 재시도
+            state["valorant"].append(article_url)
+        state["valorant"] = state["valorant"][-200:]
 
-    # PUBG: 새 글만 오래된 순으로 처리
-    new_pubg = [i for i in pubg_ids if i not in state["pubg"]]
-    for article_url in reversed(new_pubg):
-        try:
-            process(article_url, WEBHOOK_PUBG, color=0xF2A900)
-        except Exception as e:
-            print(f"[오류] PUBG 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-            continue
-        state["pubg"].append(article_url)
+    # PUBG: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
+    if check_pubg:
+        new_pubg = [i for i in pubg_ids if i not in state["pubg"]]
+        if new_pubg:
+            send_banner(WEBHOOK_PUBG, PUBG_BANNER_URL)
+        for article_url in reversed(new_pubg):
+            try:
+                process(article_url, WEBHOOK_PUBG, color=0xF2A900)
+            except Exception as e:
+                print(f"[오류] PUBG 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
+                continue
+            state["pubg"].append(article_url)
+        state["pubg"] = state["pubg"][-200:]
 
-    # 상태 파일이 무한정 커지지 않도록 최근 200개만 유지
-    state["valorant"] = state["valorant"][-200:]
-    state["pubg"] = state["pubg"][-200:]
+    # 오버워치: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
+    if check_overwatch:
+        new_overwatch = [i for i in overwatch_ids if i not in state["overwatch"]]
+        if new_overwatch:
+            send_banner(WEBHOOK_OVERWATCH, OVERWATCH_BANNER_URL)
+        for article_url in reversed(new_overwatch):
+            try:
+                process(article_url, WEBHOOK_OVERWATCH, color=0xF99E1A)
+            except Exception as e:
+                print(f"[오류] 오버워치 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
+                continue
+            state["overwatch"].append(article_url)
+        state["overwatch"] = state["overwatch"][-200:]
+
     save_state(state)
 
 

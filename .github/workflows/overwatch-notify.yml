@@ -1,9 +1,10 @@
-name: Valorant & PUBG Patch Notes Notifier
+name: Overwatch Patch Notes Notifier
 
 on:
   schedule:
-    # 매주 화요일 UTC 12:00 (한국시간 오후 9시)에 실행. 컴퓨터가 꺼져 있어도 GitHub 서버에서 동작합니다.
-    - cron: "0 12 * * 2"
+    # 매일 UTC 12:00 (한국시간 오후 9시)에 실행. 오버워치는 핫픽스가 불규칙하게
+    # 자주 나와서 발로란트/배그보다 훨씬 자주(매일) 확인합니다.
+    - cron: "0 12 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -29,17 +30,15 @@ jobs:
 
       - name: 패치노트 확인 및 디스코드 전송
         env:
-          DISCORD_WEBHOOK_VALORANT: ${{ secrets.DISCORD_WEBHOOK_VALORANT }}
-          DISCORD_WEBHOOK_PUBG: ${{ secrets.DISCORD_WEBHOOK_PUBG }}
-          DISCORD_WEBHOOK_VALORANT_ISSUES: ${{ secrets.DISCORD_WEBHOOK_VALORANT_ISSUES }}
+          DISCORD_WEBHOOK_OVERWATCH: ${{ secrets.DISCORD_WEBHOOK_OVERWATCH }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REPO_RAW_BASE: https://raw.githubusercontent.com/${{ github.repository }}/main/assets
-        run: python scripts/check_patches.py valorant,pubg
+        run: python scripts/check_patches.py overwatch
 
       - name: 상태 파일 커밋
         run: |
           git config user.name "patch-notify-bot"
           git config user.email "actions@github.com"
           git add state/state.json
-          git diff --cached --quiet || git commit -m "chore: update patch state (valorant/pubg)"
+          git diff --cached --quiet || git commit -m "chore: update patch state (overwatch)"
           git push
