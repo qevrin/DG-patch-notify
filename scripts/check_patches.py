@@ -50,6 +50,10 @@ OVERWATCH_BANNER_URL = f"{_REPO_RAW_BASE}/overwatch_banner.png" if _REPO_RAW_BAS
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (patch-notify-bot)"}
 
+# "관련 글", "관련 기사" 같은 헤딩을 만나면 그 지점부터는 패치 내용이 아니라
+# 사이트에서 추천하는 다른 글 목록이므로 더 이상 읽지 않는다.
+STOP_HEADING_RE = re.compile(r"(관련\s*글|관련\s*기사|관련\s*뉴스|함께\s*보면)")
+
 MAX_SECTIONS = 8       # 임베드에 담을 최대 섹션(필드) 수
 MAX_BULLETS = 5        # 섹션당 최대 bullet 수
 MAX_FIELD_CHARS = 950  # 디스코드 필드 value 최대 길이(1024) 여유 두고 자름
@@ -193,6 +197,14 @@ def fetch_article_details(url):
         else []
     )
 
+    # "관련 글" 같은 헤딩을 만나면 그 이후는 잘라낸다 (패치 내용이 아니므로).
+    trimmed_headings = []
+    for h in headings:
+        if STOP_HEADING_RE.search(h.get_text(" ", strip=True)):
+            break
+        trimmed_headings.append(h)
+    headings = trimmed_headings
+
     sections = []
     for h in headings[:MAX_SECTIONS]:
         heading_text = h.get_text(" ", strip=True)
@@ -233,6 +245,8 @@ def _gather_raw_text(title_tag, soup, max_chars=16000):
     parts = []
     total = 0
     for el in source:
+        if el.name in ("h2", "h3", "h4") and STOP_HEADING_RE.search(el.get_text(" ", strip=True)):
+            break  # "관련 글" 등 패치 내용이 아닌 구간을 만나면 그만 모은다
         text = el.get_text(" ", strip=True)
         if not text:
             continue
@@ -260,6 +274,8 @@ AI_SYSTEM_PROMPT = (
     "규칙: 섹션은 최대 6개, 섹션당 bullet은 최대 5개, 각 bullet은 40자 내외로 압축. "
     "오타 수정이나 사소한 UI 정렬처럼 플레이어에게 중요하지 않은 내용은 제외하고, "
     "실질적으로 게임플레이에 영향을 주는 변경사항 위주로 정리하세요. "
+    "원문 끝부분에 '관련 글', '이전 패치노트' 목록처럼 이번 패치와 무관한 다른 글 "
+    "추천 목록이 섞여 있을 수 있는데, 이런 내용은 절대 섹션으로 만들지 마세요. "
     "원문에 없는 내용을 추측해서 넣지 마세요."
 )
 
@@ -299,13 +315,16 @@ def build_embed_from_ai(details, ai_data, color):
 
     fields = []
     used_chars = 0
-    for section in ai_data.get("sections", [])[:6]:
+    for i, section in enumerate(ai_data.get("sections", [])[:6]):
         bullets = section.get("bullets", [])[:5]
         value = "\n".join(f"• {b}" for b in bullets)
         if len(value) > MAX_FIELD_CHARS:
             value = value[:MAX_FIELD_CHARS] + "…"
         if used_chars + len(value) > 5000:
             break
+        if i > 0:
+            # 섹션 사이에 빈 줄을 하나 끼워 넣어서 다닥다닥 붙어 보이지 않게 한다.
+            fields.append({"name": "\u200b", "value": "\u200b", "inline": False})
         emoji = section.get("emoji") or "📌"
         name = f"{emoji} {section.get('title', '')}"[:250]
         fields.append({"name": name, "value": value or "-", "inline": False})
@@ -333,12 +352,14 @@ def build_embed(details, color):
 
     fields = []
     used_chars = 0
-    for section in details["sections"]:
+    for i, section in enumerate(details["sections"]):
         value = "\n".join(f"• {b}" for b in section["bullets"])
         if len(value) > MAX_FIELD_CHARS:
             value = value[:MAX_FIELD_CHARS] + "…"
         if used_chars + len(value) > 5000:  # 임베드 전체 길이 여유 확보
             break
+        if i > 0:
+            fields.append({"name": "\u200b", "value": "\u200b", "inline": False})
         fields.append({"name": f"📌 {section['title']}"[:250], "value": value or "-", "inline": False})
         used_chars += len(value)
 
