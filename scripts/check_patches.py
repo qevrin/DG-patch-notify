@@ -394,101 +394,89 @@ def send_banner(webhook_url, banner_url):
 # 메인
 # ---------------------------------------------------------------------------
 
+def build_message(article_url, color):
+    """글 하나를 읽어서 디스코드로 보낼 임베드를 만든다 (전송은 하지 않는다)."""
+    details = fetch_article_details(article_url)
+    ai_data = summarize_with_ai(details.get("raw_text"))
+    if ai_data:
+        return build_embed_from_ai(details, ai_data, color)
+    return build_embed(details, color)  # AI 미사용/실패 시 원문 섹션으로 대체
+
+
+def handle_game(label, ids, key, webhook, banner_url, color, state):
+    """한 게임의 새 글을 처리한다.
+
+    1) 새 글마다 카드를 먼저 전부 만들어 본다.
+    2) 하나라도 만들어졌을 때만 배너를 한 번 보내고, 이어서 카드를 보낸다.
+       (카드를 못 만든 날 배너만 올라가서 매일 반복되는 일을 막기 위함)
+    3) 실제로 전송에 성공한 글만 "보낸 글 목록"에 기록한다.
+    """
+    seen = state.setdefault(key, [])
+    new_ids = [i for i in ids if i not in seen]
+    print(f"[{label}] 목록에서 {len(ids)}개 발견 / 기존 기록 {len(seen)}개 / 새 글 {len(new_ids)}개")
+    if ids:
+        print(f"[{label}] 목록 첫 번째 주소: {ids[0]}")
+    if not new_ids:
+        return
+
+    prepared = []
+    for article_url in reversed(new_ids):  # 오래된 순
+        try:
+            prepared.append((article_url, build_message(article_url, color)))
+        except Exception as e:
+            print(f"[오류] {label} 글 읽기/요약 실패 ({article_url}): {e}", file=sys.stderr)
+
+    if not prepared:
+        print(f"[{label}] 새 글은 있었지만 카드를 하나도 못 만들어서 전송하지 않았습니다.")
+        return
+
+    send_banner(webhook, banner_url)
+    for article_url, embed in prepared:
+        try:
+            send_discord(webhook, embed)
+        except Exception as e:
+            print(f"[오류] {label} 전송 실패 ({article_url}): {e}", file=sys.stderr)
+            continue  # 기록하지 않아 다음 실행에 재시도
+        seen.append(article_url)
+
+    state[key] = seen[-200:]
+
+
 def main():
     # 커맨드라인 인자로 "valorant", "pubg", "overwatch" 중 하나 이상을
     # 쉼표로 구분해서 주면 그 게임들만 확인한다 (예: "valorant,pubg").
     # 인자가 없으면(all) 전부 확인한다.
     game_filter = sys.argv[1] if len(sys.argv) > 1 else "all"
     games = [g.strip() for g in game_filter.split(",")]
-    check_valorant = "all" in games or "valorant" in games
-    check_pubg = "all" in games or "pubg" in games
-    check_overwatch = "all" in games or "overwatch" in games
+
+    targets = []  # (표시 이름, 상태 키, 목록 함수, 웹훅, 배너, 색상)
+    if "all" in games or "valorant" in games:
+        targets.append(("발로란트", "valorant", fetch_valorant_ids, WEBHOOK_VALORANT, VALORANT_BANNER_URL, 0xFF4655))
+    if "all" in games or "pubg" in games:
+        targets.append(("PUBG", "pubg", fetch_pubg_ids, WEBHOOK_PUBG, PUBG_BANNER_URL, 0xF2A900))
+    if "all" in games or "overwatch" in games:
+        targets.append(("오버워치", "overwatch", fetch_overwatch_ids, WEBHOOK_OVERWATCH, OVERWATCH_BANNER_URL, 0xF99E1A))
 
     state, existed = load_state()
     state.setdefault("overwatch", [])
 
-    valorant_ids = []
-    if check_valorant:
+    fetched = {}
+    for label, key, fetch_fn, *_ in targets:
         try:
-            valorant_ids = fetch_valorant_ids()
+            fetched[key] = fetch_fn()
         except Exception as e:
-            print(f"[오류] 발로란트 목록 조회 실패: {e}", file=sys.stderr)
-
-    pubg_ids = []
-    if check_pubg:
-        try:
-            pubg_ids = fetch_pubg_ids()
-        except Exception as e:
-            print(f"[오류] PUBG 목록 조회 실패: {e}", file=sys.stderr)
-
-    overwatch_ids = []
-    if check_overwatch:
-        try:
-            overwatch_ids = fetch_overwatch_ids()
-        except Exception as e:
-            print(f"[오류] 오버워치 목록 조회 실패: {e}", file=sys.stderr)
+            fetched[key] = []
+            print(f"[오류] {label} 목록 조회 실패: {e}", file=sys.stderr)
 
     if not existed:
-        if check_valorant:
-            state["valorant"] = valorant_ids
-        if check_pubg:
-            state["pubg"] = pubg_ids
-        if check_overwatch:
-            state["overwatch"] = overwatch_ids
+        for _, key, *_ in targets:
+            state[key] = fetched[key]
         save_state(state)
         print("최초 실행: 기존 글을 기준선으로 저장했습니다 (알림 없음).")
         return
 
-    def process(article_url, webhook, color):
-        details = fetch_article_details(article_url)
-        ai_data = summarize_with_ai(details.get("raw_text"))
-        if ai_data:
-            embed = build_embed_from_ai(details, ai_data, color)
-        else:
-            embed = build_embed(details, color)  # AI 미사용/실패 시 원문 섹션으로 대체
-        send_discord(webhook, embed)
-
-    # 발로란트: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
-    if check_valorant:
-        new_valorant = [i for i in valorant_ids if i not in state["valorant"]]
-        if new_valorant:
-            send_banner(WEBHOOK_VALORANT, VALORANT_BANNER_URL)
-        for article_url in reversed(new_valorant):
-            try:
-                process(article_url, WEBHOOK_VALORANT, color=0xFF4655)
-            except Exception as e:
-                print(f"[오류] 발로란트 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-                continue  # 실패하면 state에 기록하지 않아 다음 실행에 재시도
-            state["valorant"].append(article_url)
-        state["valorant"] = state["valorant"][-200:]
-
-    # PUBG: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
-    if check_pubg:
-        new_pubg = [i for i in pubg_ids if i not in state["pubg"]]
-        if new_pubg:
-            send_banner(WEBHOOK_PUBG, PUBG_BANNER_URL)
-        for article_url in reversed(new_pubg):
-            try:
-                process(article_url, WEBHOOK_PUBG, color=0xF2A900)
-            except Exception as e:
-                print(f"[오류] PUBG 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-                continue
-            state["pubg"].append(article_url)
-        state["pubg"] = state["pubg"][-200:]
-
-    # 오버워치: 새 글만 오래된 순으로 처리 (있으면 배너부터 한 번 전송)
-    if check_overwatch:
-        new_overwatch = [i for i in overwatch_ids if i not in state["overwatch"]]
-        if new_overwatch:
-            send_banner(WEBHOOK_OVERWATCH, OVERWATCH_BANNER_URL)
-        for article_url in reversed(new_overwatch):
-            try:
-                process(article_url, WEBHOOK_OVERWATCH, color=0xF99E1A)
-            except Exception as e:
-                print(f"[오류] 오버워치 글 처리 실패 ({article_url}): {e}", file=sys.stderr)
-                continue
-            state["overwatch"].append(article_url)
-        state["overwatch"] = state["overwatch"][-200:]
+    for label, key, _fetch_fn, webhook, banner_url, color in targets:
+        handle_game(label, fetched[key], key, webhook, banner_url, color, state)
 
     save_state(state)
 
