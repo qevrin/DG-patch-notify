@@ -1,0 +1,63 @@
+name: Production AI Patch Notifications
+
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: production-patch-state
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 브라우저 설치
+        run: playwright install --with-deps chromium
+
+      - name: 수집 및 AI 요약 카드 전송
+        env:
+          PATCH_DATA_DIR: state/actions
+          OVERWATCH_SOURCE: blizzard
+          GEMINI_MODEL: gemini-3.8-flash
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_VALORANT: ${{ secrets.DISCORD_WEBHOOK_VALORANT }}
+          DISCORD_WEBHOOK_PUBG: ${{ secrets.DISCORD_WEBHOOK_PUBG }}
+          DISCORD_WEBHOOK_OVERWATCH: ${{ secrets.DISCORD_WEBHOOK_OVERWATCH }}
+        run: python -u scripts/actions_notify.py
+
+      - name: 전송 기록 저장
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          files = [str(p) for p in Path('state/actions').glob('*.json')]
+          if files:
+              subprocess.run(['git', 'add', '--', *files], check=True)
+          PY
+
+          if ! git diff --cached --quiet; then
+            git config user.name "patch-notify-bot"
+            git config user.email "actions@github.com"
+            git commit -m "chore: update production AI patch state"
+            git push origin HEAD:main
+          fi
