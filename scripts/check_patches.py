@@ -26,12 +26,19 @@ import os
 import re
 import sys
 import json
+from urllib.parse import urljoin, urlsplit
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
 VALORANT_LIST_URL = "https://playvalorant.com/ko-kr/news/tags/patch-notes/"
 PUBG_LIST_URL = "https://pubg.com/ko/news?category=patch_notes"
+class SourceError(RuntimeError):
+    """Safe, application-authored source diagnostic; contains no credentials."""
+
+
+BLIZZARD_PATCH_URL = "https://overwatch.blizzard.com/ko-kr/news/patch-notes/"
 OVERWATCH_LIST_URL = "https://overwatch.nexon.com/news/patchnotes"
 
 STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "state", "state.json")
@@ -127,29 +134,182 @@ def fetch_pubg_ids():
     return ids
 
 
-def fetch_overwatch_ids():
-    # 목록 페이지가 자바스크립트 렌더링이라 Playwright로 접근.
-    # URL 패턴: /news/patchnotes/<숫자id>/<슬러그>
+def parse_overwatch_links(hrefs):
+    """Accept numeric article paths with or without a slug; ignore navigation."""
+    ids = []
+    for href in hrefs:
+        url = urlsplit(urljoin(OVERWATCH_LIST_URL, href or ""))
+        if url.scheme != "https" or url.netloc != "overwatch.nexon.com":
+            continue
+        if not re.fullmatch(r"/news/patchnotes/\d+(?:/[^/?#]+)?/?", url.path):
+            continue
+        canonical = f"https://overwatch.nexon.com{url.path.rstrip('/')}"
+        if canonical not in ids:
+            ids.append(canonical)
+    return ids
+
+
+def fetch_nexon_overwatch_ids():
     from playwright.sync_api import sync_playwright
 
-    ids = []
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(user_agent=HEADERS["User-Agent"])
-        page.goto(OVERWATCH_LIST_URL, wait_until="networkidle", timeout=30000)
-        page.wait_for_selector("a[href]", state="attached", timeout=15000)
-        anchors = page.query_selector_all("a[href]")
-        for a in anchors:
-            href = a.get_attribute("href") or ""
-            m = re.search(r"/news/patchnotes/\d+/[^/?#]+", href)
-            if not m:
-                continue
-            path = m.group(0)
-            canonical = f"https://overwatch.nexon.com{path}"
-            if canonical not in ids:
-                ids.append(canonical)
-        browser.close()
+        try:
+            page = browser.new_page(user_agent=HEADERS["User-Agent"])
+            response = page.goto(OVERWATCH_LIST_URL, wait_until="domcontentloaded", timeout=30000)
+            if response and response.status >= 400:
+                raise SourceError(f"넥슨 오버워치 목록 HTTP {response.status}")
+            # Wait for article links, not the first navigation link on the page.
+            try:
+                page.wait_for_function(r"""() => Array.from(document.querySelectorAll('a[href]'))
+                    .some(a => {
+                        const u = new URL(a.href, location.href);
+                        return u.hostname === 'overwatch.nexon.com' &&
+                            /^\/news\/patchnotes\/\d+(?:\/[^/?#]+)?\/?$/.test(u.pathname);
+                    })""", timeout=30000)
+            except Exception:
+                # Safe bounded diagnostics: only same-site patch-note paths, never tokens/query strings.
+                hrefs = page.locator('a[href]').evaluate_all("nodes => nodes.map(a => a.href)")
+                paths = []
+                for href in hrefs:
+                    url = urlsplit(href)
+                    if url.hostname == 'overwatch.nexon.com' and url.path.startswith('/news/patchnotes'):
+                        if url.path not in paths:
+                            paths.append(url.path)
+                print(f"[오버워치] 게시글 로딩 대기 실패: 전체 링크 {len(hrefs)}개, 패치 경로 {paths[:10]}",
+                      file=sys.stderr)
+                raise SourceError("넥슨 패치노트 게시글 링크를 찾지 못했습니다.") from None
+            hrefs = page.locator('a[href]').evaluate_all("nodes => nodes.map(a => a.href)")
+            ids = parse_overwatch_links(hrefs)
+            print(f"[오버워치] 넥슨 목록 수집: 게시글 {len(ids)}개", flush=True)
+            return ids
+        finally:
+            browser.close()
+
+
+def blizzard_blocks(html):
+    soup = BeautifulSoup(html, "html.parser")
+    blocks = []
+    seen = set()
+    for anchor in soup.select('[id^="patch-"]'):
+        patch_id = anchor['id']
+        if patch_id in seen:
+            continue
+        # Live HTML uses an empty .anchor INSIDE the patch container.
+        # The date ID identifies a location; its parent contains title and body.
+        if 'PatchNotes-patch' in anchor.get('class', []):
+            container = anchor
+        else:
+            container = anchor.find_parent(class_='PatchNotes-patch')
+        if container is None:
+            # Support a date anchor immediately before a sibling patch container.
+            sibling = anchor.find_next_sibling()
+            if sibling and 'PatchNotes-patch' in sibling.get('class', []):
+                container = sibling
+        if container is None:
+            continue
+        if not container.select_one('.PatchNotes-patchTitle, h2, h3, h4') or not container.select_one('p, li'):
+            continue
+        # Work on an independent copy: do not change source DOM ancestry/IDs.
+        block = BeautifulSoup(str(container), 'html.parser').find()
+        block['id'] = patch_id
+        blocks.append(block)
+        seen.add(patch_id)
+    return blocks
+
+
+def report_blizzard_structure(html, stage, status):
+    soup = BeautifulSoup(html, 'html.parser')
+    report = {
+        'stage': stage, 'status': status, 'html_chars': len(html),
+        'patch_id_nodes': len(soup.select('[id^="patch-"]')),
+        'patch_containers': len(soup.select('.PatchNotes-patch')),
+        'patch_titles': len(soup.select('.PatchNotes-patchTitle')),
+        'patch_bodies': len(soup.select('.PatchNotes-patchBody')),
+        'accepted_blocks': len(blizzard_blocks(html)),
+        'patch_nodes': [{'tag': n.name, 'id': n.get('id'), 'classes': n.get('class', []),
+                         'headings': len(n.select('h2,h3,h4')), 'paragraphs': len(n.select('p,li'))}
+                        for n in soup.select('[id^="patch-"], .PatchNotes-patch')[:15]],
+    }
+    print('[오버워치 구조 진단] ' + json.dumps(report, ensure_ascii=False), flush=True)
+    output = os.environ.get('SOURCE_DIAGNOSTIC_DIR')
+    if output:
+        folder = Path(output)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f'blizzard-{stage}.json').write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def load_blizzard_html(url):
+    response = requests.get(url.split('#')[0], headers=HEADERS, timeout=30)
+    report_blizzard_structure(response.text, 'http', response.status_code)
+    if response.status_code >= 400:
+        raise SourceError(f'블리자드 HTML 요청 HTTP {response.status_code}')
+    if blizzard_blocks(response.text):
+        return response.text
+    # Some versions hydrate patch blocks in the browser.
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page(user_agent=HEADERS['User-Agent'])
+            response = page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            if response and response.status >= 400:
+                raise SourceError(f'블리자드 패치노트 HTTP {response.status}')
+            try:
+                page.wait_for_selector('[id^="patch-"]', state='attached', timeout=30000)
+            finally:
+                report_blizzard_structure(page.content(), 'browser', response.status if response else None)
+            return page.content()
+        finally:
+            browser.close()
+
+
+def fetch_blizzard_overwatch_ids():
+    blocks = blizzard_blocks(load_blizzard_html(BLIZZARD_PATCH_URL))
+    if not blocks:
+        raise SourceError('블리자드 날짜별 패치 블록을 찾지 못했습니다.')
+    ids = list(dict.fromkeys(f"{BLIZZARD_PATCH_URL}#{block['id']}" for block in blocks))
+    print(f'[오버워치] 블리자드 날짜별 패치 {len(ids)}개 수집', flush=True)
     return ids
+
+
+def fetch_overwatch_ids():
+    # Set OVERWATCH_SOURCE=blizzard to bypass Nexon explicitly during diagnosis.
+    if os.environ.get('OVERWATCH_SOURCE') == 'blizzard':
+        return fetch_blizzard_overwatch_ids()
+    try:
+        ids = fetch_nexon_overwatch_ids()
+        if ids:
+            return ids
+    except Exception as exc:
+        print(f'[오버워치] 넥슨 수집 실패 ({type(exc).__name__}), 블리자드로 전환', flush=True)
+    return fetch_blizzard_overwatch_ids()
+
+
+def parse_blizzard_article(html, url):
+    fragment = urlsplit(url).fragment
+    block = next((b for b in blizzard_blocks(html) if b['id'] == fragment), None)
+    if block is None:
+        raise ValueError('요청한 날짜의 블리자드 패치 본문을 찾지 못했습니다.')
+    title_tag = block.select_one('.PatchNotes-patchTitle, h2, h3, h4')
+    title = title_tag.get_text(' ', strip=True)
+    body = block.select_one('.PatchNotes-patchBody') or block
+    raw = body.get_text('\n', strip=True)
+    sections = []
+    for heading in body.select('h2,h3,h4'):
+        bullets = []
+        for element in heading.find_all_next():
+            if element not in body.descendants or element.name in ['h2', 'h3', 'h4']:
+                break
+            if element.name in ['p', 'li'] and not element.find(['p', 'li']):
+                text = element.get_text(' ', strip=True)
+                if text and text not in bullets:
+                    bullets.append(text)
+        if bullets:
+            sections.append({'title': heading.get_text(' ', strip=True), 'bullets': bullets[:MAX_BULLETS]})
+    return {'title': title, 'url': url, 'description': raw[:400], 'image': None,
+            'sections': sections[:MAX_SECTIONS], 'raw_text': raw[:16000]}
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +317,8 @@ def fetch_overwatch_ids():
 # ---------------------------------------------------------------------------
 
 def fetch_article_details(url):
+    if urlsplit(url).hostname == "overwatch.blizzard.com":
+        return parse_blizzard_article(load_blizzard_html(url), url)
     resp = requests.get(url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -258,11 +420,11 @@ def _gather_raw_text(title_tag, soup, max_chars=16000):
 
 
 # ---------------------------------------------------------------------------
-# AI 요약 (ANTHROPIC_API_KEY가 설정된 경우에만 동작, 실패 시 원문 섹션으로 대체)
+# AI 요약 (운영에서는 성공한 요약만 전송, 실패 시 보류)
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-AI_MODEL = "claude-haiku-4-5-20251001"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+AI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
 
 AI_SYSTEM_PROMPT = (
     "당신은 게임 패치노트를 한국어 디스코드 커뮤니티용으로 간결하게 정리하는 도우미입니다. "
@@ -276,30 +438,115 @@ AI_SYSTEM_PROMPT = (
     "실질적으로 게임플레이에 영향을 주는 변경사항 위주로 정리하세요. "
     "원문 끝부분에 '관련 글', '이전 패치노트' 목록처럼 이번 패치와 무관한 다른 글 "
     "추천 목록이 섞여 있을 수 있는데, 이런 내용은 절대 섹션으로 만들지 마세요. "
-    "원문에 없는 내용을 추측해서 넣지 마세요."
+    "원문에 없는 내용을 추측해서 넣지 마세요. "
+    "제품명, 장치명, 영웅명, 무기명, 모드명, 도전 과제명 등 고유명사는 "
+    "원문의 철자와 언어를 그대로 유지하세요. 익숙한 이름으로 추정해 번역하거나 "
+    "음역하거나 오타를 임의로 교정하지 마세요. 예를 들어 원문이 DuanSense이면 "
+    "듀얼센스나 DualSense로 바꾸지 말고 DuanSense 그대로 쓰세요. "
+    "어떤 도전 과제의 문제인지 식별할 수 있도록 원문에 명시된 도전 과제명도 보존하세요. "
+    "버그 수정은 emoji=🛠️, title=버그 수정 섹션에 정리하세요. "
+    "리플레이 코드 삭제·초기화, 호환성 제한, 이용 제한, 사용자 조치 필요 등 "
+    "이용자가 알아야 할 주의사항은 버그 수정과 섞지 말고 별도의 마지막 섹션 "
+    "emoji=⚠️, title=참고사항에 정리하세요. "
+    "예를 들어 원문에 리플레이 코드가 모두 제거되었다고 쓰여 있으면 "
+    "참고사항에 '기존 리플레이 코드 모두 삭제'로 정리하세요. "
+    "이러한 주의사항은 중요하므로 다른 변경점보다 먼저 누락되지 않게 확보하세요. "
+    "동일 항목을 버그 수정과 참고사항에 중복해서 넣지 마세요. "
+    "원문에 해당 내용이 없으면 참고사항 섹션을 만들지 마세요. "
+    "고유명사 보존과 의미의 정확성이 40자 내외 길이 목표보다 우선합니다."
 )
 
 
+def available_flash_model():
+    """Discover a stable text Flash model; availability does not imply free quota."""
+    token = None
+    names = []
+    for _ in range(10):
+        params = {"pageSize": 100}
+        if token:
+            params["pageToken"] = token
+        response = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": GEMINI_API_KEY}, params=params, timeout=30,
+        )
+        if response.status_code != 200:
+            print(f"[경고] Gemini 모델 목록 조회 HTTP {response.status_code}", file=sys.stderr)
+            return None
+        payload = response.json()
+        for model in payload.get("models", []):
+            name = model.get("name", "").removeprefix("models/")
+            if (re.fullmatch(r"gemini-\d+(?:\.\d+)?-flash(?:-lite)?", name)
+                    and "generateContent" in model.get("supportedGenerationMethods", [])):
+                names.append(name)
+        token = payload.get("nextPageToken")
+        if not token:
+            break
+    if token:
+        print("[경고] Gemini 모델 목록 조회가 완료되지 않았습니다.", file=sys.stderr)
+        return None
+    if not names:
+        print("[경고] 사용 가능한 안정 버전 Flash 텍스트 모델이 없습니다.", file=sys.stderr)
+        return None
+    return max(names, key=lambda name: (tuple(int(n) for n in re.findall(r"\d+", name)),
+                                       name.endswith("-lite")))
+
+
 def summarize_with_ai(raw_text):
-    if not ANTHROPIC_API_KEY or not raw_text:
+    if not GEMINI_API_KEY or not raw_text:
         return None
     try:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        resp = client.messages.create(
-            model=AI_MODEL,
-            max_tokens=1200,
-            system=AI_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": raw_text}],
-        )
-        text = "".join(
-            block.text for block in resp.content if getattr(block, "type", None) == "text"
-        ).strip()
-        text = re.sub(r"^```(json)?\s*|\s*```$", "", text)
-        return json.loads(text)
-    except Exception as e:
-        print(f"[경고] AI 요약 실패, 원문 섹션으로 대체합니다: {e}", file=sys.stderr)
+        model = AI_MODEL.removeprefix("models/")
+        request_body = {
+            "systemInstruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": raw_text}]}],
+            "generationConfig": {"responseMimeType": "application/json", "maxOutputTokens": 8192},
+        }
+        def generate(selected):
+            print(f"[AI] Gemini 모델: {selected}", flush=True)
+            for attempt in range(2):
+                try:
+                    return requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{selected}:generateContent",
+                        headers={"x-goog-api-key": GEMINI_API_KEY},
+                        json=request_body,
+                        timeout=(10, 180),
+                    )
+                except requests.exceptions.ReadTimeout:
+                    if attempt == 1:
+                        raise
+                    print("[경고] Gemini 응답 대기 시간 초과. 한 번만 재시도합니다.", file=sys.stderr, flush=True)
+        resp = generate(model)
+        if resp.status_code == 404:
+            print(f"[경고] 모델 {model}을 찾지 못해 사용 가능한 Flash 모델을 조회합니다.", file=sys.stderr)
+            discovered = available_flash_model()
+            if not discovered or discovered == model:
+                return None
+            resp = generate(discovered)
+        if resp.status_code != 200:
+            # Never log request headers, API keys, or complete provider responses.
+            print(f"[경고] Gemini API HTTP {resp.status_code}: 키·무료 할당량·모델 사용 가능 여부를 확인하세요.", file=sys.stderr)
+            return None
+        candidates = resp.json().get("candidates", [])
+        if not candidates or candidates[0].get("finishReason") != "STOP":
+            print("[경고] Gemini 요약이 완료되지 않았습니다 (차단 또는 출력 길이 제한).", file=sys.stderr)
+            return None
+        text = "".join(part.get("text", "") for part in candidates[0].get("content", {}).get("parts", [])
+                       if not part.get("thought"))
+        result = json.loads(text)
+        if not isinstance(result, dict) or not isinstance(result.get("intro"), str):
+            raise ValueError("잘못된 요약 형식")
+        sections = result.get("sections")
+        if not isinstance(sections, list) or not sections:
+            raise ValueError("요약 섹션 없음")
+        for section in sections:
+            if not isinstance(section, dict) or not isinstance(section.get("title"), str):
+                raise ValueError("잘못된 섹션 형식")
+            bullets = section.get("bullets")
+            if not isinstance(bullets, list) or not all(isinstance(item, str) for item in bullets):
+                raise ValueError("잘못된 항목 형식")
+        return result
+    except Exception as exc:
+        print(f"[경고] Gemini AI 요약 실패 ({type(exc).__name__}).", file=sys.stderr)
         return None
 
 
@@ -307,7 +554,7 @@ def build_embed_from_ai(details, ai_data, color):
     embed = {
         "title": details["title"][:250],
         "url": details["url"],
-        "description": (ai_data.get("intro") or "")[:400],
+        "description": (ai_data.get("intro") or "")[:400].rstrip() + "\n\u200b",
         "color": color,
     }
     if details.get("image"):
@@ -315,22 +562,22 @@ def build_embed_from_ai(details, ai_data, color):
 
     fields = []
     used_chars = 0
-    for i, section in enumerate(ai_data.get("sections", [])[:6]):
+    for section in ai_data.get("sections", [])[:6]:
         bullets = section.get("bullets", [])[:5]
         value = "\n".join(f"• {b}" for b in bullets)
         if len(value) > MAX_FIELD_CHARS:
             value = value[:MAX_FIELD_CHARS] + "…"
         if used_chars + len(value) > 5000:
             break
-        if i > 0:
-            # 섹션 사이에 빈 줄을 하나 끼워 넣어서 다닥다닥 붙어 보이지 않게 한다.
-            fields.append({"name": "\u200b", "value": "\u200b", "inline": False})
         emoji = section.get("emoji") or "📌"
         name = f"{emoji} {section.get('title', '')}"[:250]
         fields.append({"name": name, "value": value or "-", "inline": False})
         used_chars += len(value)
 
     if fields:
+        # Preserve one blank line in Discord without adding separate spacer fields.
+        for field in fields[:-1]:
+            field["value"] += "\n\u200b"
         embed["fields"] = fields
 
     return embed
@@ -398,9 +645,9 @@ def build_message(article_url, color):
     """글 하나를 읽어서 디스코드로 보낼 임베드를 만든다 (전송은 하지 않는다)."""
     details = fetch_article_details(article_url)
     ai_data = summarize_with_ai(details.get("raw_text"))
-    if ai_data:
-        return build_embed_from_ai(details, ai_data, color)
-    return build_embed(details, color)  # AI 미사용/실패 시 원문 섹션으로 대체
+    if not ai_data:
+        raise SourceError("AI 요약 실패 또는 GEMINI_API_KEY 누락: 원문 전송 없이 보류합니다.")
+    return build_embed_from_ai(details, ai_data, color)
 
 
 def handle_game(label, ids, key, webhook, banner_url, color, state):
